@@ -19,10 +19,12 @@ use std::any::Any;
 use std::cmp::max;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, GenericStringArray, OffsetSizeTrait};
+use arrow::array::{ArrayRef, GenericStringArray, OffsetSizeTrait, StringViewArray};
 use arrow::datatypes::DataType;
 
-use datafusion_common::cast::{as_generic_string_array, as_int64_array};
+use datafusion_common::cast::{
+    as_generic_string_array, as_int64_array, as_string_view_array,
+};
 use datafusion_common::{exec_err, Result};
 use datafusion_expr::TypeSignature::Exact;
 use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
@@ -48,8 +50,10 @@ impl SubstrFunc {
             signature: Signature::one_of(
                 vec![
                     Exact(vec![Utf8, Int64]),
+                    Exact(vec![Utf8View, Int64]),
                     Exact(vec![LargeUtf8, Int64]),
                     Exact(vec![Utf8, Int64, Int64]),
+                    Exact(vec![Utf8View, Int64, Int64]),
                     Exact(vec![LargeUtf8, Int64, Int64]),
                 ],
                 Volatility::Immutable,
@@ -79,6 +83,13 @@ impl ScalarUDFImpl for SubstrFunc {
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
         match args[0].data_type() {
             DataType::Utf8 => make_scalar_function(substr::<i32>, vec![])(args),
+            DataType::Utf8View => match &args {
+                // [_, ColumnarValue::Scalar(_)]
+                // | [_, ColumnarValue::Scalar(_), ColumnarValue::Scalar(_)] => {
+                //     arrow_string::substring
+                // }
+                _ => make_scalar_function(substr_view, vec![])(args),
+            },
             DataType::LargeUtf8 => make_scalar_function(substr::<i64>, vec![])(args),
             other => exec_err!("Unsupported data type {other:?} for function substr"),
         }
@@ -86,6 +97,63 @@ impl ScalarUDFImpl for SubstrFunc {
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+}
+
+// TODO(aduffy): just return a manipulated Utf8View array by modifying the view only.
+pub fn substr_view(args: &[ArrayRef]) -> Result<ArrayRef> {
+    match args.len() {
+        2 => {
+            let string_view_array = as_string_view_array(&args[0])?;
+            let start_array = as_int64_array(&args[1])?;
+
+            let result = string_view_array
+                .iter()
+                .zip(start_array.iter())
+                .map(|(string_view, start)| match (string_view, start) {
+                    (Some(string), Some(start)) => {
+                        if start <= 0 {
+                            Some(string.to_string())
+                        } else {
+                            Some(string.chars().skip(start as usize - 1).collect())
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<StringViewArray>();
+
+            Ok(Arc::new(result))
+        }
+        3 => {
+            let string_view_array = as_string_view_array(&args[0])?;
+            let start_array = as_int64_array(&args[1])?;
+            let count_array = as_int64_array(&args[2])?;
+
+            let result = string_view_array
+                .iter()
+                .zip(start_array.iter())
+                .zip(count_array.iter())
+                .map(|((string, start), count)| match (string, start, count) {
+                    (Some(string), Some(start), Some(count)) => {
+                        if count < 0 {
+                            exec_err!(
+                                "negative substring length not allowed: substr(<str>, {start}, {count})"
+                            )
+                        } else {
+                            let skip = max(0, start - 1);
+                            let count = max(0, count + (if start < 1 { start - 1 } else { 0 }));
+                            Ok(Some(string.chars().skip(skip as usize).take(count as usize).collect::<String>()))
+                        }
+                    }
+                    _ => Ok(None),
+                })
+                .collect::<Result<StringViewArray>>()?;
+
+            Ok(Arc::new(result) as ArrayRef)
+        }
+        other => {
+            exec_err!("substr was called with {other} arguments. It requires 2 or 3.")
+        }
     }
 }
 
@@ -133,7 +201,7 @@ pub fn substr<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                             )
                         } else {
                             let skip = max(0, start - 1);
-                            let count = max(0, count + (if start < 1 {start - 1} else {0}));
+                            let count = max(0, count + (if start < 1 { start - 1 } else { 0 }));
                             Ok(Some(string.chars().skip(skip as usize).take(count as usize).collect::<String>()))
                         }
                     }
